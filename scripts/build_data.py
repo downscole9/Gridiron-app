@@ -19,7 +19,11 @@ import json
 import urllib.request
 from collections import defaultdict
 
-SEASON = "2024"  # bump this each year once nflverse publishes the new season
+BASELINE_SEASONS = ["2024"]
+# ^ Add "2025" to this list as soon as nflverse publishes it (checked periodically —
+#   as of this writing their player_stats release is still capped at 2024).
+#   Everything downstream (rank, grade, boom/bust, projections) will automatically
+#   pool games across every season listed here — no other code changes needed.
 
 NFLVERSE_BASE = "https://github.com/nflverse/nflverse-data/releases/download"
 
@@ -29,6 +33,12 @@ BOOM_BUST = {
 }
 
 MIN_GAMES = 4
+
+
+def season_label():
+    if len(BASELINE_SEASONS) == 1:
+        return BASELINE_SEASONS[0]
+    return "/".join(BASELINE_SEASONS)
 
 
 def fetch_csv(url):
@@ -53,7 +63,7 @@ def build_offense():
     totals = defaultdict(lambda: {"sum": 0.0, "n": 0})
     r = fetch_csv(f"{NFLVERSE_BASE}/player_stats/player_stats.csv")
     for row in r:
-        if row["season"] != SEASON or row["season_type"] != "REG":
+        if row["season"] not in BASELINE_SEASONS or row["season_type"] != "REG":
             continue
         pos = row["position"]
         if pos not in ("QB", "RB", "WR", "TE"):
@@ -67,7 +77,7 @@ def build_offense():
             players[name] = {"name": name, "position": pos, "team": row["recent_team"], "games": []}
         players[name]["team"] = row["recent_team"]
         players[name]["games"].append({
-            "week": row["week"], "opp": row["opponent_team"],
+            "season": row["season"], "week": row["week"], "opp": row["opponent_team"],
             "targets": row.get("targets") or "0", "receptions": row.get("receptions") or "0",
             "rec_yards": row.get("receiving_yards") or "0", "rush_yards": row.get("rushing_yards") or "0",
             "pass_yards": row.get("passing_yards") or "0", "pass_tds": row.get("passing_tds") or "0",
@@ -81,7 +91,7 @@ def build_offense():
         n = totals[name]["n"]
         if n < MIN_GAMES:
             continue
-        p["games"].sort(key=lambda g: int(g["week"]))
+        p["games"].sort(key=lambda g: (g["season"], int(g["week"])))
         p["avg_ppr"] = round(totals[name]["sum"] / n, 1)
         p["games_played"] = n
         out[name] = p
@@ -93,7 +103,7 @@ def build_kickers():
     totals = defaultdict(lambda: {"sum": 0.0, "n": 0})
     r = fetch_csv(f"{NFLVERSE_BASE}/player_stats/player_stats_kicking.csv")
     for row in r:
-        if row["season"] != SEASON or row["season_type"] != "REG":
+        if row["season"] not in BASELINE_SEASONS or row["season_type"] != "REG":
             continue
         name = row["player_display_name"]
         try:
@@ -106,7 +116,7 @@ def build_kickers():
             kickers[name] = {"name": name, "position": "K", "team": row["team"], "games": []}
         kickers[name]["team"] = row["team"]
         kickers[name]["games"].append({
-            "week": row["week"], "opp": row.get("opponent_team") or "—",
+            "season": row["season"], "week": row["week"], "opp": row.get("opponent_team") or "—",
             "fg_made": row.get("fg_made") or "0", "fg_att": row.get("fg_att") or "0",
             "fantasy_ppr": str(round(pts, 1)),
         })
@@ -118,7 +128,7 @@ def build_kickers():
         n = totals[name]["n"]
         if n < MIN_GAMES:
             continue
-        p["games"].sort(key=lambda g: int(g["week"]))
+        p["games"].sort(key=lambda g: (g["season"], int(g["week"])))
         p["avg_ppr"] = round(totals[name]["sum"] / n, 1)
         p["games_played"] = n
         out[name] = p
@@ -130,22 +140,22 @@ def build_defenses():
     opp_of = defaultdict(dict)
     r = fetch_csv(f"{NFLVERSE_BASE}/schedules/games.csv")
     for row in r:
-        if row["season"] != SEASON or row["game_type"] != "REG" or not row["home_score"]:
+        if row["season"] not in BASELINE_SEASONS or row["game_type"] != "REG" or not row["home_score"]:
             continue
-        wk = row["week"]
+        key = (row["season"], row["week"])  # namespaced so multiple seasons don't collide on week number
         home, away = row["home_team"], row["away_team"]
         hs, aws = float(row["home_score"]), float(row["away_score"])
-        pts_allowed[home][wk] = aws
-        pts_allowed[away][wk] = hs
-        opp_of[home][wk] = away
-        opp_of[away][wk] = home
+        pts_allowed[home][key] = aws
+        pts_allowed[away][key] = hs
+        opp_of[home][key] = away
+        opp_of[away][key] = home
 
     def_agg = defaultdict(lambda: defaultdict(lambda: {"sacks": 0, "ints": 0, "fum_rec": 0, "tds": 0, "safety": 0}))
     r = fetch_csv(f"{NFLVERSE_BASE}/player_stats/player_stats_def.csv")
     for row in r:
-        if row["season"] != SEASON or row["season_type"] != "REG":
+        if row["season"] not in BASELINE_SEASONS or row["season_type"] != "REG":
             continue
-        d = def_agg[row["team"]][row["week"]]
+        d = def_agg[row["team"]][(row["season"], row["week"])]
         d["sacks"] += float(row.get("def_sacks") or 0)
         d["ints"] += float(row.get("def_interceptions") or 0)
         d["fum_rec"] += float(row.get("def_fumble_recovery_opp") or 0)
@@ -155,13 +165,14 @@ def build_defenses():
     out = {}
     for team in pts_allowed:
         games, total, n = [], 0, 0
-        for wk in sorted(pts_allowed[team], key=lambda w: int(w)):
-            pa = pts_allowed[team][wk]
-            s = def_agg[team].get(wk, {"sacks": 0, "ints": 0, "fum_rec": 0, "tds": 0, "safety": 0})
+        for key in sorted(pts_allowed[team], key=lambda k: (k[0], int(k[1]))):
+            season, wk = key
+            pa = pts_allowed[team][key]
+            s = def_agg[team].get(key, {"sacks": 0, "ints": 0, "fum_rec": 0, "tds": 0, "safety": 0})
             score = (points_allowed_score(pa) + s["sacks"] + s["ints"] * 2
                      + s["fum_rec"] * 2 + s["tds"] * 6 + s["safety"] * 2)
             games.append({
-                "week": wk, "opp": opp_of[team].get(wk, "—"), "pts_allowed": pa,
+                "season": season, "week": wk, "opp": opp_of[team].get(key, "—"), "pts_allowed": pa,
                 "sacks": s["sacks"], "ints": s["ints"], "fum_rec": s["fum_rec"],
                 "def_tds": s["tds"], "fantasy_ppr": str(round(score, 1)),
             })
@@ -211,21 +222,59 @@ def enrich(all_players):
         bg, wg = p["best_game"], p["worst_game"]
         if pos == "DEF":
             p["narrative"] = (f"{p['name']} averaged {p['avg_ppr']} fantasy points per game across "
-                               f"{p['games_played']} games in {SEASON}, ranking #{p['rank']} of {p['rank_of']} defenses. "
+                               f"{p['games_played']} games ({season_label()}), ranking #{p['rank']} of {p['rank_of']} defenses. "
                                f"Best outing: Week {bg['week']} vs {bg['opp']} ({bg['fantasy_ppr']} pts). "
                                f"Floor: Week {wg['week']} vs {wg['opp']} at {wg['fantasy_ppr']} pts.")
         elif pos == "K":
             p["narrative"] = (f"{p['name']} averaged {p['avg_ppr']} fantasy points per game across "
-                               f"{p['games_played']} games in {SEASON}, ranking #{p['rank']} of {p['rank_of']} kickers. "
+                               f"{p['games_played']} games ({season_label()}), ranking #{p['rank']} of {p['rank_of']} kickers. "
                                f"Best: Week {bg['week']} vs {bg['opp']} ({bg['fg_made']}/{bg['fg_att']} FG). "
                                f"Floor: Week {wg['week']} vs {wg['opp']} at {wg['fantasy_ppr']} pts.")
         else:
             p["narrative"] = (f"{p['name']} averaged {p['avg_ppr']} PPR points per game across "
-                               f"{p['games_played']} games in {SEASON}, ranking #{p['rank']} of {p['rank_of']} {pos}s. "
+                               f"{p['games_played']} games ({season_label()}), ranking #{p['rank']} of {p['rank_of']} {pos}s. "
                                f"Ceiling: Week {bg['week']} vs {bg['opp']} ({bg['fantasy_ppr']} pts). "
                                f"Floor: Week {wg['week']} vs {wg['opp']} at {wg['fantasy_ppr']} pts. "
                                f"Boom rate ({p['boom_thr']}+): {p['boom_pct']}%. Bust rate (under {p['bust_thr']}): {p['bust_pct']}%.")
     return all_players
+
+
+def build_matchup_context():
+    """
+    Returns per-team, per-position average fantasy points allowed (used to
+    gauge how favorable a matchup is), plus per-team average points scored
+    (used for defense/DST projections). Pooled across BASELINE_SEASONS.
+    """
+    allowed = defaultdict(lambda: defaultdict(list))  # team -> pos -> [pts, ...]
+    r = fetch_csv(f"{NFLVERSE_BASE}/player_stats/player_stats.csv")
+    for row in r:
+        if row["season"] not in BASELINE_SEASONS or row["season_type"] != "REG":
+            continue
+        pos = row["position"]
+        if pos not in ("QB", "RB", "WR", "TE"):
+            continue
+        try:
+            pts = float(row["fantasy_points_ppr"] or 0)
+        except ValueError:
+            continue
+        allowed[row["opponent_team"]][pos].append(pts)
+
+    games_per_team = defaultdict(int)
+    avg_allowed = defaultdict(dict)
+    for team, posmap in allowed.items():
+        for pos, vals in posmap.items():
+            avg_allowed[team][pos] = sum(vals) / len(BASELINE_SEASONS) / 17  # approx per game across pooled seasons
+
+    points_scored = defaultdict(list)
+    r = fetch_csv(f"{NFLVERSE_BASE}/schedules/games.csv")
+    for row in r:
+        if row["season"] not in BASELINE_SEASONS or row["game_type"] != "REG" or not row["home_score"]:
+            continue
+        points_scored[row["home_team"]].append(float(row["home_score"]))
+        points_scored[row["away_team"]].append(float(row["away_score"]))
+    avg_scored = {team: sum(v) / len(v) for team, v in points_scored.items() if v}
+
+    return {"avg_allowed": dict(avg_allowed), "avg_scored": avg_scored}
 
 
 def main():
